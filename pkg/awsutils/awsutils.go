@@ -482,13 +482,15 @@ func (cache *EC2InstanceMetadataCache) initWithEC2Metadata(ctx context.Context) 
 	}
 	log.Debugf("Found availability zone: %s ", cache.availabilityZone)
 
-	// retrieve primary interface local-ipv4
-	cache.localIPv4, err = cache.imds.GetLocalIPv4(ctx)
-	if err != nil {
-		awsAPIErrInc("GetLocalIPv4", err)
-		return err
+	// retrieve primary interface local-ipv4 (skip on IPv6-only instances)
+	if cache.v4Enabled {
+		cache.localIPv4, err = cache.imds.GetLocalIPv4(ctx)
+		if err != nil {
+			awsAPIErrInc("GetLocalIPv4", err)
+			return err
+		}
+		log.Debugf("Discovered the instance primary IPv4 address: %s", cache.localIPv4)
 	}
-	log.Debugf("Discovered the instance primary IPv4 address: %s", cache.localIPv4)
 
 	// retrieve instance-id
 	cache.instanceID, err = cache.imds.GetInstanceID(ctx)
