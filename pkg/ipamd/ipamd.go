@@ -43,6 +43,7 @@ import (
 
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/awsutils"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/eniconfig"
+	"github.com/aws/amazon-vpc-cni-k8s/pkg/ipamd/adaptive"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/ipamd/datastore"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/networkutils"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/utils/cniutils"
@@ -250,6 +251,14 @@ type IPAMContext struct {
 	networkPolicyMode         string
 	enableMultiNICSupport     bool
 	withApiServer             bool
+
+	// adaptivePolicy, when non-nil, learns this node's pod demand pattern and
+	// supplies the warm and minimum IP targets in place of the static env vars.
+	// It is nil unless ENABLE_ADAPTIVE_IP_TARGET is set, so the default
+	// behaviour of every existing node is untouched.
+	adaptivePolicy    *adaptive.Policy
+	adaptiveStatePath string
+	lastAdaptiveSave  time.Time
 }
 
 type kubeletConfig struct {
@@ -448,6 +457,7 @@ func New(ctx context.Context, k8sClient client.Client, withApiServer bool) (*IPA
 	c.awsClient.InitCachedPrefixDelegation(c.enablePrefixDelegation)
 	c.myNodeName = os.Getenv(envNodeName)
 	c.withApiServer = withApiServer
+	c.initAdaptivePolicy()
 
 	if err := c.nodeInit(ctx); err != nil {
 		return nil, err
@@ -781,6 +791,11 @@ func (c *IPAMContext) StartNodeIPPoolManager(ctx context.Context) {
 
 	log.Infof("IP pool manager - max pods: %d, warm IP target: %d, warm prefix target: %d, warm ENI target: %d, minimum IP target: %d",
 		c.maxPods, c.warmIPTarget, c.warmPrefixTarget, c.warmENITarget, c.minimumIPTarget)
+	if c.adaptivePolicy != nil {
+		cfg := c.adaptivePolicy.Config()
+		log.Infof("IP pool manager - adaptive IP target enabled in %q mode, lead time %v, pre-warm window %v, warm target clamped to [%d,%d]",
+			cfg.Mode, cfg.LeadTime, cfg.PrewarmWindow, cfg.MinWarmIPTarget, cfg.MaxWarmIPTarget)
+	}
 	sleepDuration := ipPoolMonitorInterval / 2
 
 	for {
@@ -798,6 +813,8 @@ func (c *IPAMContext) updateIPPoolIfRequired(ctx context.Context) {
 	if c.enablePodENI && c.enableIPv4 && c.dataStoreAccess.GetDataStore(DefaultNetworkCardIndex).GetTrunkENI() == "" {
 		c.tryEnableSecurityGroupsForPods(ctx)
 	}
+
+	c.stepAdaptivePolicy()
 
 	isScaleDownExecuted := false
 	for networkCard, decisions := range c.isDatastorePoolTooLow() {
@@ -862,6 +879,9 @@ func (c *IPAMContext) tryFreeENI(ctx context.Context, networkCard int) {
 	if networkCard > DefaultNetworkCardIndex {
 		warmIPTarget = DefaultWarmIPTarget
 		minimumIPTarget = DefaultMinimumIPTarget
+	} else if adaptiveWarm, adaptiveMin, ok := c.adaptiveTargets(); ok {
+		warmIPTarget = adaptiveWarm
+		minimumIPTarget = adaptiveMin
 	}
 
 	eni := c.dataStoreAccess.GetDataStore(networkCard).RemoveUnusedENIFromStore(warmIPTarget, minimumIPTarget, c.warmPrefixTarget)
@@ -1936,8 +1956,12 @@ func (c *IPAMContext) verifyAndAddPrefixesToDatastore(ctx context.Context, eni s
 	return seenIPs
 }
 
-// return true when WARM_IP_TARGET or MINIMUM_IP_TARGET is defined
+// return true when WARM_IP_TARGET or MINIMUM_IP_TARGET is defined, or when the
+// adaptive policy is supplying them
 func (c *IPAMContext) warmIPTargetsDefined() bool {
+	if _, _, ok := c.adaptiveTargets(); ok {
+		return true
+	}
 	return c.warmIPTarget != noWarmIPTarget || c.minimumIPTarget != noMinimumIPTarget
 }
 
@@ -2181,6 +2205,13 @@ func (c *IPAMContext) datastoreTargetState(stats *datastore.DataStoreStats, netw
 		// multi card ENIs will use WARM_IP_TARGET=1 and MINIMUM_IP_TARGET=1 by default
 		warmIPTarget = DefaultWarmIPTarget
 		minimumIPTarget = DefaultMinimumIPTarget
+	} else if adaptiveWarm, adaptiveMin, ok := c.adaptiveTargets(); ok {
+		// The adaptive policy replaces the static targets on the primary network
+		// card only. Everything downstream of here - the short/over arithmetic,
+		// prefix delegation, ENI allocation and release - is unchanged, which is
+		// what keeps the blast radius of this feature to two integers.
+		warmIPTarget = adaptiveWarm
+		minimumIPTarget = adaptiveMin
 	} else if !c.warmIPTargetsDefined() {
 		// there is no WARM_IP_TARGET defined and no MINIMUM_IP_TARGET, fallback to use all IP addresses on ENI
 		return 0, 0, false
@@ -2215,8 +2246,8 @@ func (c *IPAMContext) datastoreTargetState(stats *datastore.DataStoreStats, netw
 		// Over will have number of IPs more than needed but with PD we would have allocated in chunks of /28
 		// Say assigned = 1, warm ip target = 16, this will need 2 prefixes. But over will return 15.
 		// Hence we need to check if 'over' number of IPs are needed to maintain the warm targets
-		prefixNeededForWarmIP := datastore.DivCeil(stats.AssignedIPs+c.warmIPTarget, numIPsPerPrefix)
-		prefixNeededForMinIP := datastore.DivCeil(c.minimumIPTarget, numIPsPerPrefix)
+		prefixNeededForWarmIP := datastore.DivCeil(stats.AssignedIPs+warmIPTarget, numIPsPerPrefix)
+		prefixNeededForMinIP := datastore.DivCeil(minimumIPTarget, numIPsPerPrefix)
 
 		// over will be number of prefixes over than needed but could be spread across used prefixes,
 		// say, after couple of pod churns, 3 prefixes are allocated with 1 IP each assigned and warm ip target is 15
@@ -2284,6 +2315,8 @@ func GetConfigForDebug() map[string]interface{} {
 	return map[string]interface{}{
 		envWarmIPTarget:             getWarmIPTarget(),
 		envWarmENITarget:            getWarmENITarget(),
+		adaptive.EnvEnable:          adaptive.Enabled(),
+		adaptive.EnvMode:            adaptive.ConfigFromEnv().Mode,
 		envCustomNetworkCfg:         UseCustomNetworkCfg(),
 		envManageENIsNonSchedulable: ManageENIsOnNonSchedulableNode(),
 		envSubnetDiscovery:          UseSubnetDiscovery(),

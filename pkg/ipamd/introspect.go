@@ -80,6 +80,7 @@ func (c *IPAMContext) setupIntrospectionServer() *http.Server {
 		"/v1/eni-configs":               eniConfigRequestHandler(c),
 		"/v1/networkutils-env-settings": networkEnvV1RequestHandler(),
 		"/v1/ipamd-env-settings":        ipamdEnvV1RequestHandler(),
+		"/v1/adaptive-ip-target":        adaptiveIPTargetRequestHandler(c),
 	}
 	paths := make([]string, 0, len(serverFunctions))
 	for path := range serverFunctions {
@@ -120,6 +121,34 @@ func (c *IPAMContext) setupIntrospectionServer() *http.Server {
 		WriteTimeout: 5 * time.Second,
 	}
 	return server
+}
+
+// adaptiveIPTargetRequestHandler reports what the adaptive warm-target policy
+// currently believes: the targets it has chosen, the state it is in, how much
+// of this node's daily pattern it has learned, and whether it is driving the
+// pool yet. It is the first thing to look at when the pool is not the size an
+// operator expected.
+func adaptiveIPTargetRequestHandler(ipam *IPAMContext) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		debug := ipam.AdaptiveDebug()
+		if debug == nil {
+			debug = map[string]interface{}{
+				"enabled": false,
+				"reason":  "ENABLE_ADAPTIVE_IP_TARGET is not set",
+			}
+		} else {
+			debug["enabled"] = true
+		}
+
+		responseJSON, err := json.Marshal(debug)
+		if err != nil {
+			log.Errorf("Failed to marshal adaptive IP target response: %v", err)
+			http.Error(w, "marshal adaptive IP target response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		logErr(w.Write(responseJSON))
+	}
 }
 
 func eniV1RequestHandler(ipam *IPAMContext) func(http.ResponseWriter, *http.Request) {

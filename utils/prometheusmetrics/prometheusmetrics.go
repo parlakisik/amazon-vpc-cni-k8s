@@ -122,6 +122,24 @@ var (
 			Help: "The number of ENIs allocated",
 		},
 	)
+	AdaptiveWarmIPTarget = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "awscni_adaptive_warm_ip_target",
+			Help: "The warm IP target chosen by the adaptive IP target policy",
+		},
+	)
+	AdaptiveMinimumIPTarget = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "awscni_adaptive_minimum_ip_target",
+			Help: "The minimum IP target chosen by the adaptive IP target policy",
+		},
+	)
+	AdaptiveReady = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "awscni_adaptive_ready",
+			Help: "1 when the adaptive IP target policy has learned enough of this node's daily pattern to drive the pool, 0 while the static targets are still in charge",
+		},
+	)
 	TotalIPs = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "awscni_total_ip_addresses",
@@ -245,6 +263,9 @@ func PrometheusRegister() {
 	prometheus.MustRegister(Ec2ApiReq)
 	prometheus.MustRegister(Ec2ApiErr)
 	prometheus.MustRegister(Enis)
+	prometheus.MustRegister(AdaptiveWarmIPTarget)
+	prometheus.MustRegister(AdaptiveMinimumIPTarget)
+	prometheus.MustRegister(AdaptiveReady)
 	prometheus.MustRegister(TotalIPs)
 	prometheus.MustRegister(AssignedIPs)
 	prometheus.MustRegister(ForceRemovedENIs)
@@ -271,6 +292,10 @@ func GetSupportedPrometheusCNIMetricsMapping() map[string]prometheus.Collector {
 		"awscni_total_ip_addresses":    TotalIPs,
 		"awscni_assigned_ip_addresses": AssignedIPs,
 		"awscni_total_ipv4_prefixes":   TotalPrefixes,
+
+		"awscni_adaptive_warm_ip_target":    AdaptiveWarmIPTarget,
+		"awscni_adaptive_minimum_ip_target": AdaptiveMinimumIPTarget,
+		"awscni_adaptive_ready":             AdaptiveReady,
 	}
 	return prometheusCNIMetrics
 }
