@@ -15,19 +15,24 @@ control interval itself.
 
 ## Short answer to "is this possible?"
 
-Yes, with three qualifications that the evaluation below establishes:
+Yes — and the evaluation is clear about which part of it does the work.
 
-1. It has to be **forecasting first and reinforcement learning second**. The
-   daily pattern is learned by a plain seasonal model; RL only chooses how much
-   headroom to keep on top of that forecast. Pure model-free RL on this control
-   loop does not work — see [What did not work](#what-did-not-work).
+1. **The forecast is the contribution; the reinforcement learning is not.** The
+   ablation below removes the RL layer entirely, leaving the seasonal forecast
+   plus a fixed conservative headroom, and the result is as good or better on
+   every workload family, at 30% fewer EC2 calls. Turning off exploration does
+   not recover the difference, so this is not an exploration artefact. The RL
+   layer is retained because it is the mechanism under study and it is not
+   harmful, but **nothing in these results justifies shipping it over the plain
+   forecasting controller.**
 2. It only beats a static setting where demand is **predictable**. On scheduled
-   bursts it is dramatically better; on unscheduled ones it is no better than a
-   small static pool, because there is nothing to forecast.
-3. It must **decline to act until it has learned something**, and fall back to
-   the static knobs until then. Without that gate it is materially worse than
-   today's default on a node's first day, which is most of the lifetime of many
-   nodes.
+   bursts it closes 91% of the address-waste gap and 98% of the pod-delay gap
+   between today's default and a clairvoyant controller. On unscheduled bursts
+   it is worse than the default on latency, because there is nothing to forecast.
+3. It must **decline to act until it has learned something**. With the readiness
+   gate a node's first day is byte-for-byte today's behaviour and the policy
+   converges on day two; without it, day one is four times worse than the
+   default on the workload the feature exists for.
 
 ## How it works
 
@@ -157,59 +162,159 @@ deliberately **not** the agent's reward — the agent is scored per control
 interval on requests it failed to serve, this charges the delay pods actually
 suffered — so an agent that games its reward does not game the score.
 
-### Results, held-out days
+### Results: 5 independently seeded trials per family, mean ± 95% CI
+
+Node: m5.xlarge-like. Every policy sees the same traces. `ORACLE` is a
+clairvoyant controller that reads the future of the trace and holds exactly the
+pool the next two minutes will need, including addresses still in cooldown. It
+is not implementable; it bounds what any forecast could achieve.
 
 ```
-workload "steady" - long-lived deployment pods, ~6/hour, no daily pattern
-  policy                                delayed%   waitSec   idleIPs   ec2calls
-  WARM_ENI_TARGET=1                         0.00         0      21.4        289
-  WARM_IP_TARGET=1                          0.00         0       1.0        856
-  WARM_IP_TARGET=5                          0.00         0       5.0        856
-  WARM_IP_TARGET=16                         0.00         0      16.0        859
-  WARM_IP_TARGET=5,MINIMUM_IP_TARGET=16     0.00         0       5.6        836
-  ADAPTIVE (RL)                             0.00         0       1.2       2037
+family "steady" - long-lived deployment pods, no daily pattern
+  policy                        pods delayed %      mean idle IPs        EC2 calls
+  WARM_ENI_TARGET=1 (default)   0.00 +/- 0.00      22.28 +/- 0.45      243 +/- 65
+  WARM_IP_TARGET=1              0.00 +/- 0.00       1.00 +/- 0.00      850 +/- 9
+  WARM_IP_TARGET=5              0.00 +/- 0.00       5.00 +/- 0.00      851 +/- 12
+  WARM_IP_TARGET=16             0.00 +/- 0.00      16.00 +/- 0.00      853 +/- 9
+  WARM_IP_TARGET=5,MIN=16       0.00 +/- 0.00       5.24 +/- 0.20      837 +/- 8
+  ADAPTIVE                      0.00 +/- 0.00       1.16 +/- 0.03     1927 +/- 118
+  ORACLE (clairvoyant)          0.00 +/- 0.00       0.17 +/- 0.01      708 +/- 15
 
-workload "diurnal" - business-hours service, arrivals peak at 15:00
-  WARM_ENI_TARGET=1                         0.00         0      21.8        441
-  WARM_IP_TARGET=1                          3.25       126       1.0       2442
-  WARM_IP_TARGET=5                          0.00         0       5.0       2423
-  WARM_IP_TARGET=16                         0.00         0      16.0       2388
-  WARM_IP_TARGET=5,MINIMUM_IP_TARGET=16     0.00         0      10.3       2007
-  ADAPTIVE (RL)                             0.07         2       2.4       5583
+family "diurnal" - business-hours service, arrivals peak at 15:00
+  WARM_ENI_TARGET=1 (default)   0.03 +/- 0.08      21.41 +/- 0.30      416 +/- 92
+  WARM_IP_TARGET=1              3.40 +/- 0.92       1.01 +/- 0.00     2582 +/- 39
+  WARM_IP_TARGET=5              0.03 +/- 0.08       5.01 +/- 0.00     2558 +/- 40
+  WARM_IP_TARGET=16             0.03 +/- 0.08      15.95 +/- 0.07     2414 +/- 112
+  WARM_IP_TARGET=5,MIN=16       0.03 +/- 0.08      10.01 +/- 0.12     2128 +/- 59
+  ADAPTIVE                      0.11 +/- 0.05       2.22 +/- 0.13     5096 +/- 387
+  ORACLE (clairvoyant)          0.04 +/- 0.12       0.44 +/- 0.01     1421 +/- 43
 
-workload "hourly-batch" - CronJob fan-out on the hour, short-lived pods
-  WARM_ENI_TARGET=1                        15.51      1426      22.1        804
-  WARM_IP_TARGET=1                         74.69     42484       1.0       2331
-  WARM_IP_TARGET=5                         37.35      1696       5.0       1717
-  WARM_IP_TARGET=16                         0.08         2      16.0       1556
-  WARM_IP_TARGET=5,MINIMUM_IP_TARGET=16    13.73       461      14.1        623
-  ADAPTIVE (RL)                             0.08         2       2.5       3884
+family "hourly-batch" - CronJob fan-out on the hour, short-lived pods
+  WARM_ENI_TARGET=1 (default)  11.31 +/- 2.56      22.57 +/- 0.33      763 +/- 37
+  WARM_IP_TARGET=1             75.63 +/- 0.74       1.03 +/- 0.00     2352 +/- 17
+  WARM_IP_TARGET=5             37.58 +/- 2.03       5.03 +/- 0.00     1702 +/- 20
+  WARM_IP_TARGET=16             0.05 +/- 0.09      16.03 +/- 0.00     1551 +/- 16
+  WARM_IP_TARGET=5,MIN=16      11.57 +/- 1.45      14.05 +/- 0.05      600 +/- 55
+  ADAPTIVE                      0.29 +/- 0.21       2.52 +/- 0.02     4210 +/- 278
+  ORACLE (clairvoyant)          0.05 +/- 0.09       0.60 +/- 0.00     1599 +/- 31
 
-workload "bursty-rollout" - steady base plus 3 unscheduled 20-40 pod rollouts/day
-  WARM_ENI_TARGET=1                         2.30        36      20.5        104
-  WARM_IP_TARGET=1                         46.99     14960       1.0       1138
-  WARM_IP_TARGET=5                          8.87       425       5.0        962
-  WARM_IP_TARGET=16                         0.00         0      16.0        921
-  WARM_IP_TARGET=5,MINIMUM_IP_TARGET=16     4.96       151       7.8        405
-  ADAPTIVE (RL)                            14.72       455       2.2       2600
+family "bursty-rollout" - steady base plus 3 unscheduled 20-40 pod rollouts/day
+  WARM_ENI_TARGET=1 (default)   1.08 +/- 1.16      20.62 +/- 0.34       96 +/- 14
+  WARM_IP_TARGET=1             44.80 +/- 3.26       1.00 +/- 0.00     1093 +/- 59
+  WARM_IP_TARGET=5              8.95 +/- 5.77       5.00 +/- 0.00      931 +/- 29
+  WARM_IP_TARGET=16             0.50 +/- 0.59      15.95 +/- 0.06      899 +/- 17
+  WARM_IP_TARGET=5,MIN=16       3.38 +/- 2.28       7.79 +/- 0.16      388 +/- 24
+  ADAPTIVE                     11.86 +/- 5.74       1.90 +/- 0.05     2445 +/- 262
+  ORACLE (clairvoyant)          0.11 +/- 0.30       0.22 +/- 0.01      845 +/- 31
 ```
 
-**The headline is hourly-batch.** The learned policy matches the best static
-setting's pod latency exactly — 0.08% delayed, 2 pod-seconds of delay across
-1296 pods — while holding **2.5 idle addresses instead of 16.0**. To get that
-latency from a static knob you must hold the burst-sized pool around the clock.
+Expressed as the fraction of the distance between today's default and perfect
+knowledge that the policy closes:
 
-**Steady and diurnal are ties or small wins.** On a flat workload nothing beats
-a tiny fixed pool, and the policy converges to within 0.2 addresses of it. On
-diurnal it lands on the efficient frontier between `WARM_IP_TARGET=1` (leaner,
-3.25% of pods delayed) and `WARM_IP_TARGET=5` (no delay, twice the addresses).
+```
+  family             metric            default   adaptive     oracle  gap closed
+  steady             idle IPs            22.28       1.16       0.17         96%
+  diurnal            idle IPs            21.41       2.22       0.44         92%
+  hourly-batch       idle IPs            22.57       2.52       0.60         91%
+  hourly-batch       pods delayed %      11.31       0.29       0.05         98%
+  bursty-rollout     idle IPs            20.62       1.90       0.22         92%
+```
 
-**Bursty-rollout is the honest loss.** Unscheduled rollouts have no seasonal
-signature, so there is nothing to forecast and the policy behaves like a lean
-static pool: 14.72% delayed at 2.2 idle addresses, between `WARM_IP_TARGET=1`
-(46.99% at 1.0) and `WARM_IP_TARGET=5` (8.87% at 5.0). Only a large static pool
-avoids the delay, at 16 addresses per node. If your bursts are unscheduled, this
-feature will not help you.
+**The scheduled-burst family is the headline.** Against today's default the
+policy cuts pods delayed from 11.3% to 0.29% *and* address waste from 22.6 to
+2.5 — it is not trading one for the other. To get that latency from a static
+knob you must hold `WARM_IP_TARGET=16` around the clock, 6x the addresses.
+
+**Bursty-rollout is the honest loss**, and it is a loss against the default, not
+just against a tuned static: 11.86% ± 5.74 of pods delayed versus the default's
+1.08%. Unscheduled rollouts have no seasonal signature, so the policy runs lean
+and pays for it. If your bursts are unscheduled, this feature will hurt you.
+
+### Ablation: what is actually doing the work
+
+Each row removes one design decision. Scheduled-burst family, same 5 trials:
+
+```
+  variant                             pods delayed %      mean idle IPs      EC2 calls
+  full policy                          0.29 +/- 0.21       2.52 +/- 0.02    4210 +/- 278
+  -RL (forecast + fixed headroom)      0.08 +/- 0.12       2.35 +/- 0.01    2983 +/- 27
+  RL without exploration               0.32 +/- 0.27       2.54 +/- 0.05    4273 +/- 446
+  -reward shaping                      5.88 +/- 2.18       2.17 +/- 0.06    3510 +/- 107
+  -seasonal pre-warm                  32.78 +/- 3.00       1.99 +/- 0.04    3548 +/- 140
+  -readiness gate                      0.46 +/- 0.32       2.55 +/- 0.05    4182 +/- 201
+  hourly profile (10min -> 60min)      0.11 +/- 0.16      13.18 +/- 0.06    4936 +/- 989
+  -target decay damping                1.25 +/- 0.75       2.06 +/- 0.03    3836 +/- 79
+```
+
+Reading it honestly:
+
+- **The seasonal pre-warm is the feature.** Removing it takes pods delayed from
+  0.29% to 32.78%. Everything else is second order.
+- **The 10-minute resolution is worth 5x the address footprint.** Hour buckets
+  reach the same latency by holding the burst-sized pool for the whole hour:
+  13.18 idle addresses against 2.52.
+- **Reward shaping is what makes the RL learn to pre-warm at all** — 5.88%
+  versus 0.29%. This is the credit-assignment result described below.
+- **The reinforcement learning does not pay for itself.** Deleting it entirely
+  and running the forecast with a fixed 2x headroom is as good or better on
+  every family (0.08% vs 0.29% delayed here; 7.74% vs 11.86% on
+  bursty-rollout), at 30% fewer EC2 calls. `RL without exploration` is
+  indistinguishable from the full policy, so this is not exploration noise at
+  evaluation time — the learned policy simply does not beat a well-specified
+  forecast with a sensible constant. On this evidence the RL layer is the part
+  to cut, not the part to ship.
+- **The readiness gate does not show up here** because these are held-out days
+  on an already-trained policy. Its effect is on day one; see the learning
+  curve.
+
+### Learning curve
+
+Score on day N of a single continuous run, never reset — the situation a real
+node is in:
+
+```
+  family            day     pods delayed %      mean idle IPs
+  hourly-batch        1    13.52 +/- 3.05      22.36 +/- 0.60     <- fallback, == default
+                      2     0.28 +/- 0.24       2.60 +/- 0.06     <- converged
+                      3     0.28 +/- 0.37       2.70 +/- 0.05
+                      8     0.28 +/- 0.24       2.57 +/- 0.09
+  steady              1     0.00 +/- 0.00      18.73 +/- 1.38
+                      2     0.00 +/- 0.00       1.22 +/- 0.04
+                      8     0.00 +/- 0.00       1.13 +/- 0.03
+```
+
+Convergence takes **one day**, which is the time needed to observe every slot
+of the daily profile once. Day one is the static fallback by construction. The
+corollary matters for deployment: a node that lives less than a day never
+benefits, so on a heavily autoscaled cluster the model would need to be seeded
+from the node group rather than learned per node.
+
+### Instance size sweep
+
+Scheduled-burst family, 5 trials:
+
+```
+  m5.large-like (3 ENI x 9 IP)     pods delayed %      mean idle IPs
+    WARM_ENI_TARGET=1 (default)   28.98 +/- 1.78      13.87 +/- 0.20
+    WARM_IP_TARGET=16              0.05 +/- 0.09      15.52 +/- 0.01
+    ADAPTIVE                       0.25 +/- 0.24       1.98 +/- 0.05
+
+  m5.4xlarge-like (8 ENI x 29 IP)
+    WARM_ENI_TARGET=1 (default)    0.05 +/- 0.09      48.18 +/- 0.72
+    WARM_IP_TARGET=16              0.05 +/- 0.09      16.04 +/- 0.00
+    ADAPTIVE                       0.23 +/- 0.19       2.72 +/- 0.12
+
+  m5.xlarge-like, prefix delegation
+    WARM_ENI_TARGET=1 (default)    0.32 +/- 0.17      27.76 +/- 0.06
+    WARM_IP_TARGET=16              0.05 +/- 0.09      26.20 +/- 0.38
+    ADAPTIVE                       0.05 +/- 0.09      15.74 +/- 0.05
+```
+
+The result is not an artefact of one instance size, and it grows with the
+instance: on a large node the default holds 48 idle addresses where the policy
+holds 2.7. Under prefix delegation the advantage narrows to roughly 2x, because
+a /28 is a coarse unit and even a perfect policy over-allocates by up to 15
+addresses at a time.
 
 ### Cost sensitivity
 

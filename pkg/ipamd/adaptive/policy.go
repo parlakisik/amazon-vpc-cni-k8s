@@ -139,8 +139,20 @@ type Config struct {
 
 	// MinProfileDays is how many days a slot of the daily profile must have been
 	// observed before the policy will drive the pool during it. Until then its
-	// targets are advisory only and the static knobs stay in charge.
+	// targets are advisory only and the static knobs stay in charge. Zero
+	// disables the gate, which is only useful as an ablation.
 	MinProfileDays int
+
+	// ProfileAggregation groups this many consecutive profile slots together
+	// when forecasting. 1 keeps the native 10-minute resolution; 6 coarsens it
+	// to hour buckets. It exists so the cost of the resolution choice can be
+	// measured rather than asserted.
+	ProfileAggregation int
+
+	// DisableLearning freezes the policy on its conservative default action.
+	// What remains is the forecast plus a fixed headroom, which is the ablation
+	// that isolates what the reinforcement learning itself contributes.
+	DisableLearning bool
 
 	// Seed makes exploration deterministic in tests and simulations.
 	Seed int64
@@ -171,18 +183,19 @@ func DefaultConfig() Config {
 		TargetDecayInterval: 30 * time.Second,
 		// A pod that cannot start is far more expensive than an idle IP, but an
 		// idle IP is not free: it is a subnet address no other node can use.
-		ShortageCost:   20.0,
-		IdleIPCost:     0.05,
-		ChurnCost:      0.5,
-		ShapingWeight:  20.0,
-		LearningRate:   0.15,
-		Discount:       0.9,
-		Epsilon:        0.15,
-		EpsilonMin:     0.01,
-		EpsilonDecay:   0.9995,
-		MinVisits:      3,
-		MinProfileDays: 1,
-		Seed:           1,
+		ShortageCost:       20.0,
+		IdleIPCost:         0.05,
+		ChurnCost:          0.5,
+		ShapingWeight:      20.0,
+		LearningRate:       0.15,
+		Discount:           0.9,
+		Epsilon:            0.15,
+		EpsilonMin:         0.01,
+		EpsilonDecay:       0.9995,
+		MinVisits:          3,
+		MinProfileDays:     1,
+		ProfileAggregation: 1,
+		Seed:               1,
 	}
 }
 
@@ -275,12 +288,17 @@ func NewPolicy(cfg Config) *Policy {
 	if cfg.TargetDecayFraction <= 0 {
 		cfg.TargetDecayFraction = def.TargetDecayFraction
 	}
+	if cfg.ProfileAggregation <= 0 {
+		cfg.ProfileAggregation = def.ProfileAggregation
+	}
 	if cfg.MaxWarmIPTarget < cfg.MinWarmIPTarget {
 		cfg.MaxWarmIPTarget = cfg.MinWarmIPTarget
 	}
+	trk := NewTracker()
+	trk.SetAggregation(cfg.ProfileAggregation)
 	return &Policy{
 		cfg:     cfg,
-		trk:     NewTracker(),
+		trk:     trk,
 		rng:     rand.New(rand.NewSource(cfg.Seed)),
 		q:       make(map[stateKey][]float64),
 		visits:  make(map[stateKey]int),
@@ -389,6 +407,10 @@ func (p *Policy) qRow(s stateKey) []float64 {
 func (p *Policy) chooseAction(s stateKey) int {
 	p.visits[s]++
 	p.explored = false
+
+	if p.cfg.DisableLearning {
+		return defaultActionIdx
+	}
 
 	// Cold start: act like a conservative static controller until this state has
 	// been seen enough times for its Q values to mean anything.

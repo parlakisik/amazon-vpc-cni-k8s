@@ -129,6 +129,9 @@ type Tracker struct {
 	pendingRelease int
 	exactEvents    bool
 
+	// aggregation groups this many consecutive slots when reading the profile.
+	aggregation int
+
 	// recent is a ring of the last recentWindow arrival counts, exposed for
 	// introspection and used to report how bursty the node currently is.
 	recent    [recentWindow]int
@@ -137,7 +140,21 @@ type Tracker struct {
 
 // NewTracker returns an empty tracker.
 func NewTracker() *Tracker {
-	return &Tracker{lastSlot: -1}
+	return &Tracker{lastSlot: -1, aggregation: 1}
+}
+
+// SetAggregation coarsens the resolution at which the daily profile is read:
+// 1 keeps the native 10-minute slots, 6 turns them into hour buckets. Slots are
+// always *recorded* at 10-minute resolution; only the lookup is grouped, so an
+// experiment can change the answer to "how finely does this need to be
+// predicted" without changing what was measured.
+func (t *Tracker) SetAggregation(n int) {
+	if n < 1 || SlotsPerDay%n != 0 {
+		n = 1
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.aggregation = n
 }
 
 // SlotOf returns the profile slot a time falls in.
@@ -399,27 +416,56 @@ func (t *Tracker) ForecastRise(now time.Time, window time.Duration) (float64, bo
 	return math.Max(0, rise), ok
 }
 
-// slotsInLocked returns the profile slots that overlap [now, now+window].
+// slotsInLocked returns the profile buckets that overlap [now, now+window],
+// merged at the configured aggregation.
 //
-// The offset within the current slot matters: a node 30 seconds into a slot
-// must not already see the next slot's burst when the window is two minutes,
+// The offset within the current bucket matters: a node 30 seconds into a bucket
+// must not already see the next bucket's burst when the window is two minutes,
 // or it pre-warms nine minutes too early and holds the burst-sized pool for the
-// whole slot.
+// whole bucket.
 func (t *Tracker) slotsInLocked(now time.Time, window time.Duration) []SlotProfile {
-	slotLen := SlotMinutes * time.Minute
-	start := SlotOf(now)
-	elapsed := time.Duration(now.Minute()%SlotMinutes)*time.Minute + time.Duration(now.Second())*time.Second
+	agg := t.aggregation
+	if agg < 1 {
+		agg = 1
+	}
+	bucketMinutes := agg * SlotMinutes
+	bucketLen := time.Duration(bucketMinutes) * time.Minute
+	buckets := SlotsPerDay / agg
 
-	out := []SlotProfile{t.state.Slots[start]}
-	for i := 1; i < SlotsPerDay; i++ {
-		// Slot start+i begins this far from now.
-		startsIn := time.Duration(i)*slotLen - elapsed
-		if startsIn > window {
+	minutesIntoDay := now.Hour()*60 + now.Minute()
+	start := minutesIntoDay / bucketMinutes
+	elapsed := time.Duration(minutesIntoDay%bucketMinutes)*time.Minute + time.Duration(now.Second())*time.Second
+
+	out := []SlotProfile{t.bucketLocked(start, agg)}
+	for i := 1; i < buckets; i++ {
+		if time.Duration(i)*bucketLen-elapsed > window {
 			break
 		}
-		out = append(out, t.state.Slots[(start+i)%SlotsPerDay])
+		out = append(out, t.bucketLocked((start+i)%buckets, agg))
 	}
 	return out
+}
+
+// bucketLocked merges agg consecutive slots into one profile. Rates are
+// averaged, because that is what a coarser bucket would have recorded; peaks
+// are taken as the maximum, because capacity has to cover the worst moment in
+// the bucket, not its average.
+func (t *Tracker) bucketLocked(bucket, agg int) SlotProfile {
+	if agg == 1 {
+		return t.state.Slots[bucket%SlotsPerDay]
+	}
+	merged := SlotProfile{Days: 1 << 30}
+	rate, n := 0.0, 0
+	for i := 0; i < agg; i++ {
+		s := t.state.Slots[(bucket*agg+i)%SlotsPerDay]
+		rate += s.ArrivalRate
+		n++
+		merged.PeakArrivals = math.Max(merged.PeakArrivals, s.PeakArrivals)
+		merged.PeakRise = math.Max(merged.PeakRise, s.PeakRise)
+		merged.Days = min(merged.Days, s.Days)
+	}
+	merged.ArrivalRate = rate / float64(n)
+	return merged
 }
 
 // ProfileReady reports whether every slot covering [now, now+window] has been
